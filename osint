@@ -1,0 +1,162 @@
+>>> ### 1. Identity Anchor Search
+... **Goal**: Establish base identity hits — does this person exist online?
+... 
+... ```
+... Query: "<FIRST LAST>"
+... Depth: advanced
+... Results: 10
+... Include answer: true
+... ```
+... 
+... Look for: matching age range, location, occupation, social handles.
+... 
+... ---
+... 
+... ### 2. Username Pivot
+... **Goal**: From any handle found in Step 1, search the username across platfo
+... rms.
+... 
+... ```
+... Query: "<username>" OR "<username variant>"
+... Depth: advanced
+... Results: 10
+... ```
+... 
+... Common variants to try: `firstname.lastname`, `firstnamelastname`, `first_la
+... st`, `flastname`, `nicknames`.
+... 
+... ---
+... 
+... ### 3. Platform Sweep
+... **Goal**: Direct check of major platforms.
+... 
+... ```
+... Query: "<FIRST LAST>" <known location/employer>
+... Include domains: [
+...   "facebook.com", "instagram.com", "twitter.com", "x.com",
+...   "tiktok.com", "linkedin.com", "pinterest.com", "youtube.com"
+... ]
+... ```
+... 
+... ---
+... 
+... ### 4. Maiden / Alternate Name (for women, name changes, professional aliase
+... s)
+... **Goal**: Catch records under a previous or alternate name.
+... 
+... ```
+... Query: "<MAIDEN/ALT NAME>"
+... Then cross-reference: "<MAIDEN NAME> <MARRIED NAME>"
+... ```
+... 
+... DOB, phone, family connections from earlier searches will validate it's the 
+... same person.
+... 
+... ---
+... 
+... ### 5. Public Records Aggregation
+... **Goal**: Pull DOB, phone, address history, relatives (free tier only).
+... 
+... ```
+... Query: "<FIRST LAST>" <city> <state>
+... Free aggregators that appear in Tavily:
+...   - spokeo.com
+...   - fastbackgroundcheck.com
+...   - truepeoplesearch.com
+...   - nationalpublicdata.com
+...   - menstoppingviolence.org
+... ```
+... 
+... Cross-reference **at least 2** aggregators before trusting the data — they s
+... yndicate from each other and propagate errors.
+... 
+... ---
+... 
+... ### 6. Family Network Map
+... **Goal**: Expand to siblings, parents, spouses listed in records.
+... 
+... For each relative found in Step 5, run Step 1 on them. Sketch a graph:
+... ```
+... Subject — Spouse — Spouse's family
+...    |
+...    Parents — Siblings — Their families
+... ```
+... 
+... This often reveals the subject's heritage, hometown, and additional handles.
+... 
+... 
+... ---
+... 
+... ### 7. Professional Verification
+... **Goal**: Confirm employer + role from authoritative sources.
+... 
+... ```
+... Query: "<FIRST LAST>" <employer> <city>
+... Look for: staff directories, board minutes, school council pages,
+...           conference attendee lists, public filings
+... ```
+... 
+... These are higher trust than aggregator data.
+... 
+... ---
+... 
+... ### 8. Heritage / Genealogy (optional)
+... **Goal**: Family origin, immigration story.
+... 
+... ```
+... Query: "<SURNAME>" <suspected country/region> family
+... Sources: ancestry.com, familysearch.org, geni.com
+... ```
+... 
+... ---
+... 
+... ## The Master Prompt
+... 
+... Use this with Claude to analyze the consolidated search results into a clean
+...  OSINT report.
+... 
+... ```
+... You are an OSINT analyst. The subject is <FULL NAME> in <CITY, STATE>.
+... Authorization: <self / consented family / bug-bounty scope / etc.>
+... 
+... I've run searches across these angles and pasted the raw results below:
+... - Identity anchor
+... - Username pivots
+... - Platform sweep
+... - Maiden/alternate name (if applicable)
+... - Public records aggregators
+... - Family network
+... - Professional sources
+... - Genealogy (optional)
+... 
+... Produce a structured report:
+... 
+... ## Identity
+... - Full name (incl. maiden/alternate)
+... - DOB or age range
+... - Current city / past locations
+... - Phone (if surfaced from ≥2 sources)
+... 
+... ## Family Network
+... - Relatives by name, with surface location
+... 
+... ## Professional
+... - Current role + employer (cite authoritative source)
+... - Past roles if visible
+... 
+... ## Social Media
+... - Platform → handle → public/private → activity level
+... - Privacy posture (strong / medium / weak)
+... 
+... ## Heritage (optional)
+... - Family origin if traceable
+... 
+... ## Confidence
+... - For each section: high (≥2 corroborating sources) / medium (1 source) / lo
+... w (inference)
+... 
+... ## Gaps
+... - What couldn't be found
+... - What's only behind paywalled aggregators
+... 
+... Be precise. Cite source URLs. Don't fabricate. Fl

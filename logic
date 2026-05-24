@@ -1,0 +1,455 @@
+
+
+## Overview
+
+The agent runs as a continuous loop with three distinct modes:
+
+| Mode | Trigger | Purpose |
+|------|---------|---------|
+| **Ingest** | Daily cron / manual | Read new content from feeds, extract technique patterns |
+| **Index** | After ingest | Store structured techniques to knowledge base |
+| **Apply** | Active test session | Query KB against target fingerprint, surface relevant techniques |
+
+---
+
+## Agent Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    INGEST LAYER                         │
+│  RSS feeds · GitHub commits · Twitter/X · YouTube       │
+└────────────────────┬────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────┐
+│                 EXTRACTION LAYER                        │
+│  Prompt: Technique Extractor  →  Structured JSON output │
+└────────────────────┬────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────┐
+│               KNOWLEDGE BASE (vector store)             │
+│  Techniques · Sources · Stack tags · Novelty score      │
+└────────────────────┬────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────┐
+│                  APPLY LAYER                            │
+│  Target fingerprint → KB query → Ranked technique list  │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Prompt Chain — Step by Step
+
+### Step 1 · Content Fetch Agent
+
+**Role:** Pulls raw content from sources daily.
+
+**System prompt:**
+```
+You are a security research feed aggregator. Your job is to fetch and
+clean content from the following sources. For each item return:
+- source_url
+- title
+- published_date
+- raw_text (cleaned, no HTML)
+- content_type: one of [writeup, cve_advisory, blog_post, talk_transcript, repo_commit]
+
+Do not summarize. Return raw cleaned text only. Flag items published
+in the last 48 hours as is_new: true.
+```
+
+**Feed list to configure:**
+```yaml
+rss_feeds:
+  - https://portswigger.net/research/rss
+  - https://feeds.feedburner.com/Exploitdb
+  - https://blog.orange.tw/feeds/posts/default
+  - https://blog.assetnote.io/feed.xml
+  - https://labs.detectify.com/feed/
+  - https://msrc.microsoft.com/blog/feed
+
+github_watch:
+  - swisskyrepo/PayloadsAllTheThings        # watch: new commits to /Web*
+  - projectdiscovery/nuclei-templates       # watch: new .yaml files
+  - carlospolop/hacktricks                  # watch: new .md files
+  - danielmiessler/SecLists                 # watch: new wordlists
+
+nvd_filter:
+  cpe_keywords:
+    - microsoft:asp.net
+    - microsoft:iis
+    - microsoft:.net_framework
+  severity: [HIGH, CRITICAL]
+```
+
+---
+
+### Step 2 · Technique Extractor
+
+**Role:** Reads each raw content item and extracts structured vulnerability technique objects.
+
+**System prompt:**
+```
+You are a security technique extraction engine. Given a raw security
+research article, blog post, CVE advisory, or bug bounty write-up,
+extract every distinct vulnerability technique described.
+
+For each technique output a JSON object with this exact schema:
+
+{
+  "technique_name": "short descriptive name (5-8 words max)",
+  "technique_summary": "1-2 sentence plain english description of what the technique does",
+  "attack_class": one of [auth_bypass, authz_failure, idor, sqli, ssrf, xxe,
+                           deserialization, info_disclosure, logic_flaw,
+                           race_condition, request_smuggling, prototype_pollution,
+                           other],
+  "applicable_stacks": ["asp.net", "iis", "java", "php", "node", "nginx", ...],
+  "trigger_conditions": ["condition 1", "condition 2"],
+  "test_pattern": "the exact HTTP request pattern or behavior to look for (concise)",
+  "safe_to_test": true | false,
+  "requires_auth": true | false,
+  "novelty": one of [known, variant, novel],
+  "source_url": "original article URL",
+  "source_date": "YYYY-MM-DD",
+  "tags": ["tag1", "tag2"]
+}
+
+Rules:
+- Extract every distinct technique, even if the article covers many.
+- If a technique requires destructive actions (write, delete, mass enum),
+  set safe_to_test: false.
+- novelty = known if it's a well-documented classic technique.
+- novelty = variant if it's a twist on a known technique.
+- novelty = novel if you have not seen this pattern before.
+- Output only valid JSON array. No prose, no markdown fences.
+```
+
+**Example output:**
+```json
+[
+  {
+    "technique_name": "FormsAuth bypass via .ashx handler gap",
+    "technique_summary": "ASP.NET FormsAuthentication module does not cover IHttpHandler endpoints by default. Handlers at .ashx paths can be called without a valid session cookie.",
+    "attack_class": "auth_bypass",
+    "applicable_stacks": ["asp.net", "iis"],
+    "trigger_conditions": [
+      "application uses FormsAuthentication",
+      "one or more .ashx handlers exist in protected directories"
+    ],
+    "test_pattern": "GET /Admin/Export.ashx without Cookie header — observe if 200 returned vs 302 to login",
+    "safe_to_test": true,
+    "requires_auth": false,
+    "novelty": "known",
+    "source_url": "https://example.com/article",
+    "source_date": "2024-11-01",
+    "tags": ["formsauth", "ashx", "handler", "iis"]
+  }
+]
+```
+
+---
+
+### Step 3 · Novelty & Dedup Filter
+
+**Role:** Checks extracted techniques against the existing knowledge base before storing.
+
+**System prompt:**
+```
+You are a deduplication and novelty scoring agent for a security
+technique knowledge base.
+
+You will receive:
+1. A new candidate technique (JSON)
+2. The top-5 most similar existing techniques from the KB (JSON array)
+
+Your job:
+- If the candidate is substantially identical to an existing entry,
+  output: {"action": "skip", "reason": "duplicate of <existing_id>"}
+
+- If the candidate is a meaningful variant or update, output:
+  {"action": "update", "target_id": "<existing_id>", "merged": <merged_json>}
+
+- If the candidate is genuinely new, output:
+  {"action": "store", "technique": <candidate_json>}
+
+Scoring guidance:
+- Same attack class + same stack + same trigger = likely duplicate
+- Same attack class + new stack or new trigger = variant → update
+- Different attack class or fundamentally different mechanism = new → store
+```
+
+---
+
+### Step 4 · Target Fingerprint Builder
+
+**Role:** Builds a structured profile of the target application before the Apply step.
+
+**System prompt:**
+```
+You are a target application fingerprinting agent. Given the following
+observations about a target web application, produce a structured
+fingerprint JSON.
+
+Input observations may include:
+- HTTP response headers
+- Page source snippets
+- Error messages
+- URL patterns observed
+- Cookie names and formats
+- Any other observable signals
+
+Output schema:
+{
+  "framework": ["asp.net webforms" | "asp.net mvc" | "asp.net core" | "unknown"],
+  "iis_version": "string or null",
+  "dotnet_version": "string or null",
+  "auth_mechanism": ["formsauth" | "windows auth" | "jwt" | "session cookie" | "unknown"],
+  "endpoint_patterns": ["aspx", "ashx", "asmx", "svc", "api/", "mvc routes"],
+  "observable_identifiers": ["sequential int ids" | "guids" | "mixed"],
+  "client_state": ["viewstate present" | "hidden fields" | "none observed"],
+  "error_handling": ["custom errors on" | "ysod visible" | "generic 500"],
+  "interesting_headers": ["list of non-standard headers observed"],
+  "tech_stack_confidence": "high | medium | low",
+  "notes": "any other relevant observations"
+}
+```
+
+**How to populate the fingerprint (manual or automated):**
+
+```bash
+# Quick recon commands to feed into the fingerprinter
+
+# Grab headers
+curl -sI https://target.com | grep -Ei 'server|x-powered|x-aspnet|set-cookie'
+
+# Check for common diagnostic paths
+for path in /trace.axd /elmah.axd /web.config /robots.txt /sitemap.xml; do
+  echo "--- $path ---"
+  curl -so /dev/null -w "%{http_code}" https://target.com$path
+  echo ""
+done
+
+# Probe endpoint types
+for ext in .aspx .ashx .asmx .svc; do
+  echo "Probing $ext..."
+done
+```
+
+---
+
+### Step 5 · Technique Recommendation Engine
+
+**Role:** Given the target fingerprint, queries the knowledge base and returns a prioritized list of techniques to try.
+
+**System prompt:**
+```
+You are a bug bounty technique recommendation engine.
+
+You will receive:
+1. A target fingerprint (JSON)
+2. A list of candidate techniques from the knowledge base (JSON array)
+
+Your job is to rank and filter the techniques by relevance to this
+specific target. For each recommended technique output:
+
+{
+  "rank": integer,
+  "technique_name": "string",
+  "relevance_score": 0.0-1.0,
+  "why_relevant": "1 sentence explaining the match to the target fingerprint",
+  "adapted_test_pattern": "the test pattern rewritten for THIS specific target
+                           (use actual paths, cookies, parameters observed)",
+  "expected_signal": "what to look for in the response if vulnerable",
+  "safe_to_run": true | false,
+  "estimated_impact": "Critical | High | Medium | Low"
+}
+
+Ranking rules:
+1. Techniques matching the exact stack (framework + auth mechanism) rank highest.
+2. Novel or variant techniques rank above known/classic ones of equal relevance.
+3. safe_to_test: false techniques are listed last and marked clearly.
+4. Do not recommend techniques requiring destructive actions.
+5. Max 15 recommendations per session.
+```
+
+**Example recommendation output:**
+```json
+{
+  "rank": 1,
+  "technique_name": "FormsAuth bypass via .ashx handler gap",
+  "relevance_score": 0.97,
+  "why_relevant": "Target uses FormsAuthentication (observed .ASPXAUTH cookie) and has confirmed .ashx endpoints at /Handlers/",
+  "adapted_test_pattern": "GET /Handlers/ExportData.ashx?format=csv — send without Cookie header, observe if 200 returned",
+  "expected_signal": "HTTP 200 with CSV content-type or JSON body instead of 302 redirect to /Account/Login",
+  "safe_to_run": true,
+  "estimated_impact": "High"
+}
+```
+
+---
+
+### Step 6 · Finding Formatter
+
+**Role:** After a test produces evidence, formats it into a clean bug bounty report section.
+
+**System prompt:**
+```
+You are a bug bounty report writer. Given:
+1. The technique that was tested
+2. The HTTP request used (provided by tester)
+3. The HTTP response received (provided by tester)
+4. Any additional tester notes
+
+Produce a structured finding report in this format:
+
+## Finding: [concise title]
+
+**Severity:** Critical | High | Medium | Low
+**Type:** Auth Bypass | AuthZ Failure | IDOR | Info Disclosure | Logic Flaw
+**Endpoint:** METHOD /path
+
+### Evidence (non-destructive)
+[Request block]
+[Response block — truncated to key fields only, never full data dumps]
+
+### Impact
+[Concrete, non-speculative impact statement. What can an attacker do?
+Tie to data classification if known.]
+
+### Reproduction steps
+1. [Exact step]
+2. [Exact step]
+3. [Observable outcome]
+
+### Safe testing constraints observed
+- Single-request proof of concept only
+- No data modification attempted
+- No enumeration beyond 2-3 records to prove existence
+
+### Remediation
+[Framework-specific fix. Be specific — name the attribute, config
+setting, or code pattern that resolves it.]
+
+Rules:
+- Never include full data dumps in evidence.
+- Never speculate about impact beyond what was directly observed.
+- Keep the request/response blocks to the minimum that proves the issue.
+- Use present tense for impact ("an attacker can read...").
+```
+
+---
+
+## Daily Cron Schedule
+
+```
+06:00  → Step 1: Fetch all feeds (RSS, GitHub, NVD)
+06:30  → Step 2: Run Technique Extractor on new items
+07:00  → Step 3: Dedup filter + store to KB
+07:15  → Summary digest email/Slack: "N new techniques added, M updates"
+
+On demand (active test session):
+  → Step 4: Build target fingerprint from recon output
+  → Step 5: Query KB → get ranked technique list
+  → [Manual testing]
+  → Step 6: Format findings as reports
+```
+
+---
+
+## Knowledge Base Schema
+
+Store each technique as a vector-embedded document with these metadata fields for filtering:
+
+```python
+{
+  "id": "uuid",
+  "technique_name": str,
+  "technique_summary": str,        # embed this field
+  "attack_class": str,             # filter
+  "applicable_stacks": list[str],  # filter
+  "trigger_conditions": list[str], # embed
+  "test_pattern": str,             # embed
+  "safe_to_test": bool,            # filter
+  "novelty": str,                  # filter / sort
+  "source_url": str,
+  "source_date": date,             # sort / recency boost
+  "tags": list[str],               # filter
+  "times_applied": int,            # increment when used
+  "confirmed_findings": int,       # increment on confirmed vuln
+  "hit_rate": float                # confirmed_findings / times_applied
+}
+```
+
+**Retrieval query for Step 5:**
+```python
+# Pseudo-code
+results = kb.query(
+    vector=embed(target_fingerprint_summary),
+    filter={
+        "applicable_stacks": {"$in": target.framework + target.endpoint_patterns},
+        "safe_to_test": True,
+        "attack_class": {"$in": relevant_classes_for_target}
+    },
+    sort=[
+        ("novelty", DESC),       # novel techniques first
+        ("source_date", DESC),   # recent first
+        ("hit_rate", DESC)       # proven techniques up
+    ],
+    top_k=30  # feed top 30 to Step 5 for re-ranking
+)
+```
+
+---
+
+## Feed Quality Scoring
+
+Not all sources are equal. Score each source after 30 days:
+
+| Source | Signal type | Update frequency | Recommended weight |
+|--------|-------------|------------------|--------------------|
+| PortSwigger Research | Novel techniques | Monthly | 1.0 |
+| Orange Tsai blog | Novel chains | Quarterly | 1.0 |
+| Nuclei templates (new) | Codified findings | Daily | 0.9 |
+| HackerOne Hacktivity | Real-world writeups | Daily | 0.85 |
+| NVD HIGH/CRIT feed | CVE advisories | Daily | 0.8 |
+| Assetnote blog | Recon + novel endpoints | Monthly | 0.8 |
+| Detectify Labs | ASP.NET/IIS specific | Monthly | 0.85 |
+| PayloadsAllTheThings commits | Payload updates | Weekly | 0.7 |
+| Exploit-DB webapps | POC code | Daily | 0.65 |
+| MSRC Patch Tuesday | Root cause hints | Monthly | 0.75 |
+
+Use source weight as a multiplier on novelty score during Step 3.
+
+---
+
+## What Separates This From a Simple Summarizer
+
+The key is the **adapted test pattern** in Step 5. The agent doesn't just retrieve techniques — it rewrites the test pattern using:
+
+- Actual paths observed on the target
+- Actual cookie names from the target's responses  
+- Actual parameter names seen in the target's requests
+- The target's specific auth mechanism
+
+This contextual translation is what turns generic research into actionable, targeted tests.
+
+---
+
+## Recommended Stack
+
+| Component | Options |
+|-----------|---------|
+| Orchestration | LangGraph, CrewAI, or custom Python |
+| LLM | Claude Sonnet (extraction + recommendation), Claude Haiku (dedup filter) |
+| Vector store | Chroma (local), Pinecone (cloud), pgvector (postgres) |
+| Feed fetching | `feedparser` + `httpx` + GitHub API |
+| Scheduler | `apscheduler` or system cron |
+| Storage | SQLite (small scale) or Postgres |
+| Reporting | Markdown → PDF via `pandoc` |
+
+---
+
+*Last updated: 2026-05-24 | For authorized testing only*
